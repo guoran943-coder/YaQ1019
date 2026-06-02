@@ -2,7 +2,17 @@
 
 import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { Loader2, SendHorizontal, Wifi, WifiOff } from "lucide-react";
+import {
+  Image as ImageIcon,
+  Loader2,
+  Mic,
+  Paperclip,
+  SendHorizontal,
+  Square,
+  Wifi,
+  WifiOff,
+  X,
+} from "lucide-react";
 import { getAnonymousIdentity } from "@/lib/identity";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 import type { ChatMessage, ConnectionState } from "@/types/chat";
@@ -11,7 +21,11 @@ type RoomChatProps = {
   roomId: string;
 };
 
+type MediaType = "image" | "audio";
+
+const CHAT_MEDIA_BUCKET = "chat-media";
 const MAX_TEXT_LENGTH = 1000;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const RATE_LIMIT_MS = 3000;
 
 const connectionCopy: Record<ConnectionState, string> = {
@@ -23,6 +37,10 @@ const connectionCopy: Record<ConnectionState, string> = {
 
 export function RoomChat({ roomId }: RoomChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [mediaUrls, setMediaUrls] = useState<Record<string, string>>({});
+  const [audioDurations, setAudioDurations] = useState<Record<string, number>>({});
+  const [activeAudioId, setActiveAudioId] = useState<string | null>(null);
+  const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [nickname, setNickname] = useState("");
   const [connectionState, setConnectionState] = useState<ConnectionState>(
@@ -30,10 +48,16 @@ export function RoomChat({ roomId }: RoomChatProps) {
   );
   const [isLoading, setIsLoading] = useState(Boolean(isSupabaseConfigured));
   const [isSending, setIsSending] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [cooldownUntil, setCooldownUntil] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   const listRef = useRef<HTMLDivElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
 
   const lastSentAtKey = `temporary-private-chat-last-sent-at-${roomId}`;
 
@@ -49,15 +73,44 @@ export function RoomChat({ roomId }: RoomChatProps) {
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    return () => {
+      stopRecordingStream();
+    };
+  }, []);
+
   const cooldownMs = Math.max(0, cooldownUntil - now);
   const trimmedDraft = draft.trim();
-  const canSend =
+  const canSendText =
     Boolean(supabase) &&
     Boolean(nickname) &&
     Boolean(trimmedDraft) &&
     trimmedDraft.length <= MAX_TEXT_LENGTH &&
     !isSending &&
+    !isRecording &&
     cooldownMs === 0;
+
+  const canSendMedia = Boolean(supabase) && Boolean(nickname) && !isSending && cooldownMs === 0;
+
+  const loadSignedUrl = useCallback(async (message: ChatMessage) => {
+    const client = supabase;
+    const storagePath = message.file_url;
+
+    if (!client || !storagePath || message.type === "text") {
+      return;
+    }
+
+    const { data, error } = await client.storage
+      .from(CHAT_MEDIA_BUCKET)
+      .createSignedUrl(storagePath, 60 * 60);
+
+    if (!error && data?.signedUrl) {
+      setMediaUrls((current) => ({
+        ...current,
+        [message.id]: data.signedUrl,
+      }));
+    }
+  }, []);
 
   const loadMessages = useCallback(async () => {
     if (!supabase) {
@@ -80,11 +133,15 @@ export function RoomChat({ roomId }: RoomChatProps) {
       setErrorMessage(`读取消息失败：${error.message}`);
       setMessages([]);
     } else {
-      setMessages((data ?? []) as ChatMessage[]);
+      const nextMessages = (data ?? []) as ChatMessage[];
+      setMessages(nextMessages);
+      nextMessages.forEach((message) => {
+        void loadSignedUrl(message);
+      });
     }
 
     setIsLoading(false);
-  }, [roomId]);
+  }, [loadSignedUrl, roomId]);
 
   useEffect(() => {
     const client = supabase;
@@ -108,7 +165,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
           filter: `room_id=eq.${roomId}`,
         },
         (payload) => {
-          setMessages((current) => appendMessage(current, payload.new as ChatMessage));
+          const nextMessage = payload.new as ChatMessage;
+          setMessages((current) => appendMessage(current, nextMessage));
+          void loadSignedUrl(nextMessage);
         },
       )
       .subscribe((status) => {
@@ -125,7 +184,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
     return () => {
       void client.removeChannel(channel);
     };
-  }, [loadMessages, roomId]);
+  }, [loadMessages, loadSignedUrl, roomId]);
 
   useEffect(() => {
     listRef.current?.scrollTo({
@@ -134,24 +193,22 @@ export function RoomChat({ roomId }: RoomChatProps) {
     });
   }, [messages.length]);
 
-  async function sendMessage(event?: FormEvent<HTMLFormElement>) {
+  async function handleTextSubmit(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
+    await sendTextMessage(trimmedDraft);
+  }
 
-    if (!supabase || !nickname || !trimmedDraft) {
+  async function sendTextMessage(content: string) {
+    if (!supabase || !nickname || !content) {
       return;
     }
 
-    if (trimmedDraft.length > MAX_TEXT_LENGTH) {
+    if (content.length > MAX_TEXT_LENGTH) {
       setErrorMessage(`消息最多 ${MAX_TEXT_LENGTH} 个字符。`);
       return;
     }
 
-    const lastSentAt = Number(window.localStorage.getItem(lastSentAtKey) ?? "0");
-    const nextAvailableAt = lastSentAt + RATE_LIMIT_MS;
-
-    if (Date.now() < nextAvailableAt) {
-      setCooldownUntil(nextAvailableAt);
-      setErrorMessage("发送太快，请稍后再试。");
+    if (!canSendNow()) {
       return;
     }
 
@@ -163,7 +220,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
       .insert({
         room_id: roomId,
         nickname,
-        content: trimmedDraft,
+        content,
         type: "text",
         file_url: null,
       })
@@ -177,9 +234,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
       return;
     }
 
-    const sentAt = Date.now();
-    window.localStorage.setItem(lastSentAtKey, String(sentAt));
-    setCooldownUntil(sentAt + RATE_LIMIT_MS);
+    markSent();
     setDraft("");
 
     if (data) {
@@ -187,10 +242,236 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
   }
 
+  async function sendMediaMessage(type: MediaType, url: string) {
+    if (!supabase || !nickname || !url) {
+      return;
+    }
+
+    if (!canSendNow()) {
+      return;
+    }
+
+    setIsSending(true);
+    setErrorMessage("");
+
+    const { data, error } = await supabase
+      .from("messages")
+      .insert({
+        room_id: roomId,
+        nickname,
+        content: url,
+        type,
+        file_url: url,
+      })
+      .select("id,room_id,nickname,content,type,file_url,created_at,expires_at")
+      .single();
+
+    setIsSending(false);
+
+    if (error) {
+      setErrorMessage(`发送失败：${error.message}`);
+      return;
+    }
+
+    markSent();
+
+    if (data) {
+      const nextMessage = data as ChatMessage;
+      setMessages((current) => appendMessage(current, nextMessage));
+      void loadSignedUrl(nextMessage);
+    }
+  }
+
+  async function handleImageChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith("image/")) {
+      setErrorMessage("只能上传图片文件。");
+      return;
+    }
+
+    if (file.size > MAX_FILE_BYTES) {
+      setErrorMessage("单个图片最大 20MB。");
+      return;
+    }
+
+    if (!canSendMedia) {
+      showCooldownOrBusyError();
+      return;
+    }
+
+    const uploadedPath = await uploadMediaFile(file, "image");
+    if (uploadedPath) {
+      await sendMediaMessage("image", uploadedPath);
+    }
+  }
+
+  async function startRecording() {
+    if (!canSendMedia) {
+      showCooldownOrBusyError();
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setErrorMessage("当前浏览器不支持录音。");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+      recordingChunksRef.current = [];
+      recordingStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (recordEvent) => {
+        if (recordEvent.data.size > 0) {
+          recordingChunksRef.current.push(recordEvent.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        void handleRecordingStop(recorder.mimeType || "audio/webm");
+      };
+
+      recorder.start();
+      setIsRecording(true);
+      setErrorMessage("");
+    } catch (error) {
+      stopRecordingStream();
+      setIsRecording(false);
+      setErrorMessage(error instanceof Error ? `录音失败：${error.message}` : "录音失败。");
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+  }
+
+  async function handleRecordingStop(mimeType: string) {
+    const chunks = recordingChunksRef.current;
+    const extension = mimeType.includes("mp4") ? "m4a" : "webm";
+    const file = new File(chunks, `voice-${Date.now()}.${extension}`, {
+      type: mimeType,
+    });
+
+    stopRecordingStream();
+    setIsRecording(false);
+
+    if (file.size === 0) {
+      setErrorMessage("没有录到声音。");
+      return;
+    }
+
+    if (file.size > MAX_FILE_BYTES) {
+      setErrorMessage("单个语音最大 20MB。");
+      return;
+    }
+
+    const uploadedPath = await uploadMediaFile(file, "audio");
+    if (uploadedPath) {
+      await sendMediaMessage("audio", uploadedPath);
+    }
+  }
+
+  function stopRecordingStream() {
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    recordingChunksRef.current = [];
+  }
+
+  async function uploadMediaFile(file: File, type: MediaType) {
+    const client = supabase;
+
+    if (!client) {
+      setErrorMessage("缺少 Supabase 环境变量，无法上传。");
+      return null;
+    }
+
+    setIsSending(true);
+    setErrorMessage("");
+
+    const extension = getSafeExtension(file.name, type);
+    const path = `${roomId}/${type}/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+
+    const { error } = await client.storage.from(CHAT_MEDIA_BUCKET).upload(path, file, {
+      cacheControl: "3600",
+      contentType: file.type,
+      upsert: false,
+    });
+
+    setIsSending(false);
+
+    if (error) {
+      setErrorMessage(`上传失败：${error.message}`);
+      return null;
+    }
+
+    return path;
+  }
+
+  function canSendNow() {
+    const lastSentAt = Number(window.localStorage.getItem(lastSentAtKey) ?? "0");
+    const nextAvailableAt = lastSentAt + RATE_LIMIT_MS;
+
+    if (Date.now() < nextAvailableAt) {
+      setCooldownUntil(nextAvailableAt);
+      setErrorMessage("发送太快，请稍后再试。");
+      return false;
+    }
+
+    return true;
+  }
+
+  function markSent() {
+    const sentAt = Date.now();
+    window.localStorage.setItem(lastSentAtKey, String(sentAt));
+    setCooldownUntil(sentAt + RATE_LIMIT_MS);
+  }
+
+  function showCooldownOrBusyError() {
+    if (cooldownMs > 0) {
+      setErrorMessage("发送太快，请稍后再试。");
+      return;
+    }
+
+    if (isSending) {
+      setErrorMessage("正在发送上一条消息。");
+      return;
+    }
+
+    setErrorMessage("当前暂时不能发送。");
+  }
+
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      void sendMessage();
+      void sendTextMessage(trimmedDraft);
+    }
+  }
+
+  function handleAudioPlay(messageId: string) {
+    Object.entries(audioRefs.current).forEach(([id, audio]) => {
+      if (id !== messageId && audio && !audio.paused) {
+        audio.pause();
+      }
+    });
+    setActiveAudioId(messageId);
+  }
+
+  function handleAudioPause(messageId: string) {
+    if (activeAudioId === messageId) {
+      setActiveAudioId(null);
     }
   }
 
@@ -265,15 +546,76 @@ export function RoomChat({ roomId }: RoomChatProps) {
                     <span className="max-w-44 truncate font-semibold">{message.nickname}</span>
                     <span>{formatMessageTime(message.created_at)}</span>
                   </div>
-                  <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</p>
+                  {message.type === "text" ? (
+                    <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</p>
+                  ) : null}
+                  {message.type === "image" ? (
+                    <ImageMessage
+                      imageUrl={mediaUrls[message.id]}
+                      isMine={isMine}
+                      onOpen={(url) => setPreviewImageUrl(url)}
+                    />
+                  ) : null}
+                  {message.type === "audio" ? (
+                    <AudioMessage
+                      audioUrl={mediaUrls[message.id]}
+                      duration={audioDurations[message.id]}
+                      isActive={activeAudioId === message.id}
+                      isMine={isMine}
+                      onDuration={(duration) =>
+                        setAudioDurations((current) => ({
+                          ...current,
+                          [message.id]: duration,
+                        }))
+                      }
+                      onPause={() => handleAudioPause(message.id)}
+                      onPlay={() => handleAudioPlay(message.id)}
+                      refSetter={(node) => {
+                        audioRefs.current[message.id] = node;
+                      }}
+                    />
+                  ) : null}
                 </div>
               </article>
             );
           })}
         </div>
 
-        <form onSubmit={sendMessage} className="border-t border-zinc-200 bg-white p-3 sm:p-4">
+        <form onSubmit={handleTextSubmit} className="border-t border-zinc-200 bg-white p-3 sm:p-4">
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleImageChange}
+          />
           <div className="flex items-end gap-2">
+            <button
+              type="button"
+              onClick={() => imageInputRef.current?.click()}
+              disabled={!canSendMedia || isRecording}
+              className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-zinc-300 bg-white text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400"
+              title="发送图片"
+            >
+              <Paperclip className="h-5 w-5" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={isRecording ? stopRecording : startRecording}
+              disabled={!isRecording && !canSendMedia}
+              className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border transition disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400 ${
+                isRecording
+                  ? "border-red-200 bg-red-50 text-red-700 hover:bg-red-100"
+                  : "border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-100"
+              }`}
+              title={isRecording ? "停止录音" : "发送语音"}
+            >
+              {isRecording ? (
+                <Square className="h-4 w-4 fill-current" aria-hidden="true" />
+              ) : (
+                <Mic className="h-5 w-5" aria-hidden="true" />
+              )}
+            </button>
             <label className="sr-only" htmlFor="message">
               消息内容
             </label>
@@ -284,13 +626,13 @@ export function RoomChat({ roomId }: RoomChatProps) {
               onKeyDown={handleKeyDown}
               maxLength={MAX_TEXT_LENGTH}
               rows={1}
-              placeholder="输入消息"
-              disabled={!supabase || isSending}
+              placeholder={isRecording ? "正在录音" : "输入消息"}
+              disabled={!supabase || isSending || isRecording}
               className="max-h-32 min-h-11 flex-1 resize-none rounded-lg border border-zinc-300 bg-zinc-50 px-3 py-2.5 text-sm leading-6 text-zinc-950 outline-none transition focus:border-emerald-600 focus:bg-white focus:ring-2 focus:ring-emerald-100 disabled:cursor-not-allowed disabled:bg-zinc-100"
             />
             <button
               type="submit"
-              disabled={!canSend}
+              disabled={!canSendText}
               className="inline-flex h-11 shrink-0 items-center gap-2 rounded-lg bg-zinc-950 px-4 text-sm font-semibold text-white transition hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-emerald-200 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500"
               title={cooldownMs > 0 ? `还需等待 ${Math.ceil(cooldownMs / 1000)} 秒` : "发送"}
             >
@@ -304,8 +646,11 @@ export function RoomChat({ roomId }: RoomChatProps) {
               </span>
             </button>
           </div>
-          <div className="mt-2 flex items-center justify-end text-xs text-zinc-500">
-            {trimmedDraft.length}/{MAX_TEXT_LENGTH}
+          <div className="mt-2 flex items-center justify-between gap-3 text-xs text-zinc-500">
+            <span>{isRecording ? "正在录音，点方块结束" : "图片和语音最大 20MB"}</span>
+            <span>
+              {trimmedDraft.length}/{MAX_TEXT_LENGTH}
+            </span>
           </div>
         </form>
       </div>
@@ -313,7 +658,104 @@ export function RoomChat({ roomId }: RoomChatProps) {
       <Link href="/" className="mt-3 text-center text-sm font-medium text-zinc-600 hover:text-zinc-950">
         返回首页
       </Link>
+
+      {previewImageUrl ? (
+        <button
+          type="button"
+          className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/80 p-4"
+          onClick={() => setPreviewImageUrl(null)}
+          aria-label="关闭图片预览"
+        >
+          <X className="absolute right-4 top-4 h-7 w-7 text-white" aria-hidden="true" />
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={previewImageUrl}
+            alt="聊天图片预览"
+            className="max-h-full max-w-full rounded-lg object-contain"
+          />
+        </button>
+      ) : null}
     </section>
+  );
+}
+
+function ImageMessage({
+  imageUrl,
+  isMine,
+  onOpen,
+}: {
+  imageUrl?: string;
+  isMine: boolean;
+  onOpen: (url: string) => void;
+}) {
+  if (!imageUrl) {
+    return <p className="text-sm opacity-80">正在加载图片</p>;
+  }
+
+  return (
+    <button type="button" className="block text-left" onClick={() => onOpen(imageUrl)}>
+      <span className={`mb-2 flex items-center gap-2 text-xs ${isMine ? "text-emerald-50" : "text-zinc-500"}`}>
+        <ImageIcon className="h-3.5 w-3.5" aria-hidden="true" />
+        点击放大
+      </span>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={imageUrl} alt="聊天图片" className="max-h-72 rounded-md object-contain" />
+    </button>
+  );
+}
+
+function AudioMessage({
+  audioUrl,
+  duration,
+  isActive,
+  isMine,
+  onDuration,
+  onPause,
+  onPlay,
+  refSetter,
+}: {
+  audioUrl?: string;
+  duration?: number;
+  isActive: boolean;
+  isMine: boolean;
+  onDuration: (duration: number) => void;
+  onPause: () => void;
+  onPlay: () => void;
+  refSetter: (node: HTMLAudioElement | null) => void;
+}) {
+  if (!audioUrl) {
+    return <p className="text-sm opacity-80">正在加载语音</p>;
+  }
+
+  return (
+    <div
+      className={`min-w-56 rounded-md border p-2 transition ${
+        isActive
+          ? isMine
+            ? "border-white bg-white/15"
+            : "border-emerald-500 bg-emerald-50"
+          : isMine
+            ? "border-white/20 bg-white/10"
+            : "border-zinc-200 bg-zinc-50"
+      }`}
+    >
+      <div className={`mb-2 flex items-center justify-between gap-3 text-xs ${isMine ? "text-white" : "text-zinc-600"}`}>
+        <span className="inline-flex items-center gap-1.5">
+          <Mic className="h-3.5 w-3.5" aria-hidden="true" />
+          语音消息
+        </span>
+        <span>{formatDuration(duration)}</span>
+      </div>
+      <audio
+        ref={refSetter}
+        controls
+        src={audioUrl}
+        className="w-full"
+        onLoadedMetadata={(event) => onDuration(event.currentTarget.duration)}
+        onPause={onPause}
+        onPlay={onPlay}
+      />
+    </div>
   );
 }
 
@@ -334,4 +776,24 @@ function formatMessageTime(value: string) {
     second: "2-digit",
     hour12: false,
   }).format(new Date(value));
+}
+
+function formatDuration(value?: number) {
+  if (!value || !Number.isFinite(value)) {
+    return "00:00";
+  }
+
+  const minutes = Math.floor(value / 60);
+  const seconds = Math.floor(value % 60);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function getSafeExtension(fileName: string, type: MediaType) {
+  const extension = fileName.split(".").pop()?.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  if (extension) {
+    return extension;
+  }
+
+  return type === "image" ? "jpg" : "webm";
 }
