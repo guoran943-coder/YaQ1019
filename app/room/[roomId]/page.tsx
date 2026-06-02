@@ -1,5 +1,7 @@
 import { RoomChat } from "@/components/room-chat";
 
+export const runtime = "edge";
+
 type RoomPageProps = {
   params: Promise<{
     roomId: string;
