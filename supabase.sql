@@ -1,7 +1,41 @@
--- Text-only temporary room chat MVP.
+-- Temporary room chat schema.
 -- Run this file in Supabase SQL Editor before testing locally.
 
 create extension if not exists pgcrypto;
+
+insert into storage.buckets (
+  id,
+  name,
+  public,
+  file_size_limit,
+  allowed_mime_types
+)
+values (
+  'chat-media',
+  'chat-media',
+  false,
+  20971520,
+  array['image/*', 'audio/*']::text[]
+)
+on conflict (id) do update
+set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "Anon can read chat media" on storage.objects;
+create policy "Anon can read chat media"
+on storage.objects
+for select
+to anon
+using (bucket_id = 'chat-media');
+
+drop policy if exists "Anon can upload chat media" on storage.objects;
+create policy "Anon can upload chat media"
+on storage.objects
+for insert
+to anon
+with check (bucket_id = 'chat-media');
 
 drop table if exists public.messages cascade;
 
@@ -42,11 +76,22 @@ for insert
 to anon
 with check (
   expires_at > now()
-  and type = 'text'
-  and file_url is null
+  and (
+    (
+      type = 'text'
+      and file_url is null
+      and char_length(btrim(content)) between 1 and 1000
+    )
+    or
+    (
+      type in ('image', 'audio')
+      and file_url is not null
+      and content = file_url
+      and char_length(btrim(file_url)) > 0
+    )
+  )
   and char_length(btrim(room_id)) > 0
   and char_length(btrim(nickname)) between 1 and 32
-  and char_length(btrim(content)) between 1 and 1000
 );
 
 do $$
