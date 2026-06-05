@@ -81,6 +81,10 @@ export function RoomChat({ roomId }: RoomChatProps) {
   const channelRef = useRef<RealtimeChannel | null>(null);
   const connectionStateRef = useRef<ConnectionState>(connectionState);
   const initialLoadDoneRef = useRef(false);
+  const hasInitialScrolledRef = useRef(false);
+  const initialScrollPendingRef = useRef(false);
+  const isInitialScrollSettlingRef = useRef(false);
+  const initialScrollTimersRef = useRef<number[]>([]);
   const shouldStickToBottomRef = useRef(true);
   const pendingScrollBehaviorRef = useRef<ScrollBehavior | null>(null);
   const subscribeVersionRef = useRef(0);
@@ -105,10 +109,24 @@ export function RoomChat({ roomId }: RoomChatProps) {
     return () => {
       stopRecordingStream();
       clearLongPressTimer();
+      clearInitialScrollTimers();
 
       if (highlightTimerRef.current) {
         window.clearTimeout(highlightTimerRef.current);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!("scrollRestoration" in window.history)) {
+      return;
+    }
+
+    const previousScrollRestoration = window.history.scrollRestoration;
+    window.history.scrollRestoration = "manual";
+
+    return () => {
+      window.history.scrollRestoration = previousScrollRestoration;
     };
   }, []);
 
@@ -139,22 +157,48 @@ export function RoomChat({ roomId }: RoomChatProps) {
     return list.scrollHeight - list.scrollTop - list.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
   }, []);
 
+  const scrollListToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const list = listRef.current;
+
+    if (!list) {
+      return;
+    }
+
+    list.scrollTo({
+      top: list.scrollHeight,
+      behavior,
+    });
+    shouldStickToBottomRef.current = true;
+  }, []);
+
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        const list = listRef.current;
-
-        if (!list) {
-          return;
-        }
-
-        list.scrollTo({
-          top: list.scrollHeight,
-          behavior,
-        });
+        scrollListToBottom(behavior);
       });
     });
-  }, []);
+  }, [scrollListToBottom]);
+
+  const scheduleInitialScrollToBottom = useCallback(() => {
+    clearInitialScrollTimers();
+    initialScrollPendingRef.current = false;
+    hasInitialScrolledRef.current = true;
+    isInitialScrollSettlingRef.current = true;
+    shouldStickToBottomRef.current = true;
+
+    window.requestAnimationFrame(() => {
+      scrollListToBottom("auto");
+    });
+
+    initialScrollTimersRef.current = [
+      window.setTimeout(() => scrollListToBottom("auto"), 100),
+      window.setTimeout(() => scrollListToBottom("auto"), 300),
+      window.setTimeout(() => scrollListToBottom("auto"), 800),
+      window.setTimeout(() => {
+        isInitialScrollSettlingRef.current = false;
+      }, 1600),
+    ];
+  }, [scrollListToBottom]);
 
   const queueScrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     pendingScrollBehaviorRef.current = behavior;
@@ -164,7 +208,16 @@ export function RoomChat({ roomId }: RoomChatProps) {
     shouldStickToBottomRef.current = isNearBottom();
   }, [isNearBottom]);
 
-  const keepBottomIfNeeded = useCallback(() => {
+  const maybeScrollToBottom = useCallback(() => {
+    if (
+      !hasInitialScrolledRef.current ||
+      initialScrollPendingRef.current ||
+      isInitialScrollSettlingRef.current
+    ) {
+      scrollToBottom("auto");
+      return;
+    }
+
     if (shouldStickToBottomRef.current || isNearBottom()) {
       scrollToBottom("auto");
     }
@@ -224,8 +277,10 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
       initialLoadDoneRef.current = true;
 
-      if (options.forceScrollToBottom || shouldScrollAfterLoad) {
-        queueScrollToBottom(options.forceScrollToBottom ? "auto" : "smooth");
+      if (options.forceScrollToBottom && !hasInitialScrolledRef.current) {
+        initialScrollPendingRef.current = true;
+      } else if (shouldScrollAfterLoad) {
+        queueScrollToBottom("smooth");
       }
     }
 
@@ -309,6 +364,10 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
 
     initialLoadDoneRef.current = false;
+    hasInitialScrolledRef.current = false;
+    initialScrollPendingRef.current = false;
+    isInitialScrollSettlingRef.current = false;
+    clearInitialScrollTimers();
     shouldStickToBottomRef.current = true;
     void loadMessages({ forceScrollToBottom: true });
     void subscribeToRoom();
@@ -325,6 +384,11 @@ export function RoomChat({ roomId }: RoomChatProps) {
   }, [loadMessages, subscribeToRoom]);
 
   useEffect(() => {
+    if (initialScrollPendingRef.current && !hasInitialScrolledRef.current) {
+      scheduleInitialScrollToBottom();
+      return;
+    }
+
     const behavior = pendingScrollBehaviorRef.current;
 
     if (!behavior) {
@@ -333,7 +397,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
     pendingScrollBehaviorRef.current = null;
     scrollToBottom(behavior);
-  }, [messages, scrollToBottom]);
+  }, [messages, scheduleInitialScrollToBottom, scrollToBottom]);
 
   useEffect(() => {
     function refreshVisibleRoom() {
@@ -674,6 +738,12 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
   }
 
+  function clearInitialScrollTimers() {
+    initialScrollTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    initialScrollTimersRef.current = [];
+    isInitialScrollSettlingRef.current = false;
+  }
+
   function jumpToQuotedMessage(messageId: string | null) {
     if (!messageId) {
       return;
@@ -817,7 +887,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
                     <ImageMessage
                       imageUrl={mediaUrls[message.id]}
                       isMine={isMine}
-                      onLoad={keepBottomIfNeeded}
+                      onLoad={maybeScrollToBottom}
                       onOpen={(url) => setPreviewImageUrl(url)}
                     />
                   ) : null}
@@ -833,7 +903,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
                           [message.id]: duration,
                         }))
                       }
-                      onLoaded={keepBottomIfNeeded}
+                      onLoaded={maybeScrollToBottom}
                       onPause={() => handleAudioPause(message.id)}
                       onPlay={() => handleAudioPlay(message.id)}
                       refSetter={(node) => {
