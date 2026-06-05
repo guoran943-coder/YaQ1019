@@ -13,6 +13,7 @@ import {
   WifiOff,
   X,
 } from "lucide-react";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { getAnonymousIdentity } from "@/lib/identity";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 import type { ChatMessage, ConnectionState } from "@/types/chat";
@@ -22,11 +23,16 @@ type RoomChatProps = {
 };
 
 type MediaType = "image" | "audio";
+type LoadMessagesOptions = {
+  forceScrollToBottom?: boolean;
+  silent?: boolean;
+};
 
 const CHAT_MEDIA_BUCKET = "chat-media";
 const MAX_TEXT_LENGTH = 1000;
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const RATE_LIMIT_MS = 3000;
+const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
 
 const connectionCopy: Record<ConnectionState, string> = {
   connecting: "连接中",
@@ -58,6 +64,12 @@ export function RoomChat({ roomId }: RoomChatProps) {
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const connectionStateRef = useRef<ConnectionState>(connectionState);
+  const initialLoadDoneRef = useRef(false);
+  const shouldStickToBottomRef = useRef(true);
+  const pendingScrollBehaviorRef = useRef<ScrollBehavior | null>(null);
+  const subscribeVersionRef = useRef(0);
 
   const lastSentAtKey = `temporary-private-chat-last-sent-at-${roomId}`;
 
@@ -79,6 +91,10 @@ export function RoomChat({ roomId }: RoomChatProps) {
     };
   }, []);
 
+  useEffect(() => {
+    connectionStateRef.current = connectionState;
+  }, [connectionState]);
+
   const cooldownMs = Math.max(0, cooldownUntil - now);
   const trimmedDraft = draft.trim();
   const canSendText =
@@ -91,6 +107,47 @@ export function RoomChat({ roomId }: RoomChatProps) {
     cooldownMs === 0;
 
   const canSendMedia = Boolean(supabase) && Boolean(nickname) && !isSending && cooldownMs === 0;
+
+  const isNearBottom = useCallback(() => {
+    const list = listRef.current;
+
+    if (!list) {
+      return true;
+    }
+
+    return list.scrollHeight - list.scrollTop - list.clientHeight <= BOTTOM_FOLLOW_THRESHOLD_PX;
+  }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const list = listRef.current;
+
+        if (!list) {
+          return;
+        }
+
+        list.scrollTo({
+          top: list.scrollHeight,
+          behavior,
+        });
+      });
+    });
+  }, []);
+
+  const queueScrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    pendingScrollBehaviorRef.current = behavior;
+  }, []);
+
+  const handleListScroll = useCallback(() => {
+    shouldStickToBottomRef.current = isNearBottom();
+  }, [isNearBottom]);
+
+  const keepBottomIfNeeded = useCallback(() => {
+    if (shouldStickToBottomRef.current || isNearBottom()) {
+      scrollToBottom("auto");
+    }
+  }, [isNearBottom, scrollToBottom]);
 
   const loadSignedUrl = useCallback(async (message: ChatMessage) => {
     const client = supabase;
@@ -112,14 +169,20 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
   }, []);
 
-  const loadMessages = useCallback(async () => {
+  const loadMessages = useCallback(async (options: LoadMessagesOptions = {}) => {
     if (!supabase) {
       setConnectionState("missing-config");
       setIsLoading(false);
       return;
     }
 
-    setIsLoading(true);
+    const shouldScrollAfterLoad =
+      options.forceScrollToBottom || shouldStickToBottomRef.current || isNearBottom();
+
+    if (!options.silent) {
+      setIsLoading(true);
+    }
+
     setErrorMessage("");
 
     const { data, error } = await supabase
@@ -131,19 +194,26 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
     if (error) {
       setErrorMessage(`读取消息失败：${error.message}`);
-      setMessages([]);
     } else {
-      const nextMessages = (data ?? []) as ChatMessage[];
+      const nextMessages = normalizeMessages((data ?? []) as ChatMessage[]);
       setMessages(nextMessages);
       nextMessages.forEach((message) => {
         void loadSignedUrl(message);
       });
+
+      initialLoadDoneRef.current = true;
+
+      if (options.forceScrollToBottom || shouldScrollAfterLoad) {
+        queueScrollToBottom(options.forceScrollToBottom ? "auto" : "smooth");
+      }
     }
 
-    setIsLoading(false);
-  }, [loadSignedUrl, roomId]);
+    if (!options.silent) {
+      setIsLoading(false);
+    }
+  }, [isNearBottom, loadSignedUrl, queueScrollToBottom, roomId]);
 
-  useEffect(() => {
+  const subscribeToRoom = useCallback(async () => {
     const client = supabase;
 
     if (!client) {
@@ -152,7 +222,20 @@ export function RoomChat({ roomId }: RoomChatProps) {
       return;
     }
 
-    void loadMessages();
+    const version = subscribeVersionRef.current + 1;
+    subscribeVersionRef.current = version;
+
+    if (channelRef.current) {
+      const previousChannel = channelRef.current;
+      channelRef.current = null;
+      await client.removeChannel(previousChannel);
+    }
+
+    if (version !== subscribeVersionRef.current) {
+      return;
+    }
+
+    setConnectionState("connecting");
 
     const channel = client
       .channel(`room:${roomId}`)
@@ -166,32 +249,97 @@ export function RoomChat({ roomId }: RoomChatProps) {
         },
         (payload) => {
           const nextMessage = payload.new as ChatMessage;
+          const shouldFollow = shouldStickToBottomRef.current || isNearBottom();
+
+          if (shouldFollow) {
+            queueScrollToBottom("smooth");
+          }
+
           setMessages((current) => appendMessage(current, nextMessage));
           void loadSignedUrl(nextMessage);
         },
-      )
-      .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          setConnectionState("online");
-          return;
-        }
+      );
 
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
-          setConnectionState("offline");
-        }
-      });
+    channelRef.current = channel;
 
-    return () => {
-      void client.removeChannel(channel);
-    };
-  }, [loadMessages, loadSignedUrl, roomId]);
+    channel.subscribe((status) => {
+      if (channelRef.current !== channel) {
+        return;
+      }
+
+      if (status === "SUBSCRIBED") {
+        setConnectionState("online");
+        return;
+      }
+
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        setConnectionState("offline");
+      }
+    });
+  }, [isNearBottom, loadSignedUrl, queueScrollToBottom, roomId]);
 
   useEffect(() => {
-    listRef.current?.scrollTo({
-      top: listRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [messages.length]);
+    const client = supabase;
+
+    if (!client) {
+      setConnectionState("missing-config");
+      setIsLoading(false);
+      return;
+    }
+
+    initialLoadDoneRef.current = false;
+    shouldStickToBottomRef.current = true;
+    void loadMessages({ forceScrollToBottom: true });
+    void subscribeToRoom();
+
+    return () => {
+      subscribeVersionRef.current += 1;
+
+      if (channelRef.current) {
+        const currentChannel = channelRef.current;
+        channelRef.current = null;
+        void client.removeChannel(currentChannel);
+      }
+    };
+  }, [loadMessages, subscribeToRoom]);
+
+  useEffect(() => {
+    const behavior = pendingScrollBehaviorRef.current;
+
+    if (!behavior) {
+      return;
+    }
+
+    pendingScrollBehaviorRef.current = null;
+    scrollToBottom(behavior);
+  }, [messages, scrollToBottom]);
+
+  useEffect(() => {
+    function refreshVisibleRoom() {
+      void loadMessages({
+        forceScrollToBottom: !initialLoadDoneRef.current,
+        silent: initialLoadDoneRef.current,
+      });
+
+      if (!channelRef.current || connectionStateRef.current !== "online") {
+        void subscribeToRoom();
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        refreshVisibleRoom();
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("online", refreshVisibleRoom);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("online", refreshVisibleRoom);
+    };
+  }, [loadMessages, subscribeToRoom]);
 
   async function handleTextSubmit(event?: FormEvent<HTMLFormElement>) {
     event?.preventDefault();
@@ -238,6 +386,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
     setDraft("");
 
     if (data) {
+      queueScrollToBottom("smooth");
       setMessages((current) => appendMessage(current, data as ChatMessage));
     }
   }
@@ -277,6 +426,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
     if (data) {
       const nextMessage = data as ChatMessage;
+      queueScrollToBottom("smooth");
       setMessages((current) => appendMessage(current, nextMessage));
       void loadSignedUrl(nextMessage);
     }
@@ -510,7 +660,11 @@ export function RoomChat({ roomId }: RoomChatProps) {
           </div>
         ) : null}
 
-        <div ref={listRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-zinc-50 px-4 py-4">
+        <div
+          ref={listRef}
+          className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-zinc-50 px-4 py-4"
+          onScroll={handleListScroll}
+        >
           {isLoading ? (
             <div className="flex h-full min-h-64 items-center justify-center text-sm text-zinc-500">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
@@ -553,6 +707,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
                     <ImageMessage
                       imageUrl={mediaUrls[message.id]}
                       isMine={isMine}
+                      onLoad={keepBottomIfNeeded}
                       onOpen={(url) => setPreviewImageUrl(url)}
                     />
                   ) : null}
@@ -568,6 +723,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
                           [message.id]: duration,
                         }))
                       }
+                      onLoaded={keepBottomIfNeeded}
                       onPause={() => handleAudioPause(message.id)}
                       onPlay={() => handleAudioPlay(message.id)}
                       refSetter={(node) => {
@@ -682,10 +838,12 @@ export function RoomChat({ roomId }: RoomChatProps) {
 function ImageMessage({
   imageUrl,
   isMine,
+  onLoad,
   onOpen,
 }: {
   imageUrl?: string;
   isMine: boolean;
+  onLoad: () => void;
   onOpen: (url: string) => void;
 }) {
   if (!imageUrl) {
@@ -699,7 +857,7 @@ function ImageMessage({
         点击放大
       </span>
       {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={imageUrl} alt="聊天图片" className="max-h-72 rounded-md object-contain" />
+      <img src={imageUrl} alt="聊天图片" className="max-h-72 rounded-md object-contain" onLoad={onLoad} />
     </button>
   );
 }
@@ -710,6 +868,7 @@ function AudioMessage({
   isActive,
   isMine,
   onDuration,
+  onLoaded,
   onPause,
   onPlay,
   refSetter,
@@ -719,6 +878,7 @@ function AudioMessage({
   isActive: boolean;
   isMine: boolean;
   onDuration: (duration: number) => void;
+  onLoaded: () => void;
   onPause: () => void;
   onPlay: () => void;
   refSetter: (node: HTMLAudioElement | null) => void;
@@ -751,7 +911,10 @@ function AudioMessage({
         controls
         src={audioUrl}
         className="w-full"
-        onLoadedMetadata={(event) => onDuration(event.currentTarget.duration)}
+        onLoadedMetadata={(event) => {
+          onDuration(event.currentTarget.duration);
+          onLoaded();
+        }}
         onPause={onPause}
         onPlay={onPlay}
       />
@@ -764,7 +927,11 @@ function appendMessage(current: ChatMessage[], nextMessage: ChatMessage) {
     return current;
   }
 
-  return [...current, nextMessage].sort(
+  return normalizeMessages([...current, nextMessage]);
+}
+
+function normalizeMessages(messages: ChatMessage[]) {
+  return Array.from(new Map(messages.map((message) => [message.id, message])).values()).sort(
     (left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime(),
   );
 }
