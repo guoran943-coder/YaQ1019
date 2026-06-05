@@ -7,6 +7,7 @@ import {
   Loader2,
   Mic,
   Paperclip,
+  Reply,
   SendHorizontal,
   Square,
   Wifi,
@@ -23,16 +24,26 @@ type RoomChatProps = {
 };
 
 type MediaType = "image" | "audio";
+type ReplyTarget = {
+  id: string;
+  sender: string;
+  type: ChatMessage["type"];
+  content: string;
+};
 type LoadMessagesOptions = {
   forceScrollToBottom?: boolean;
   silent?: boolean;
 };
 
+const MESSAGE_SELECT_FIELDS =
+  "id,room_id,nickname,content,type,file_url,reply_to_id,reply_to_content,reply_to_type,reply_to_sender,created_at,expires_at";
 const CHAT_MEDIA_BUCKET = "chat-media";
 const MAX_TEXT_LENGTH = 1000;
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const RATE_LIMIT_MS = 3000;
 const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
+const LONG_PRESS_MS = 550;
+const HIGHLIGHT_MS = 1400;
 
 const connectionCopy: Record<ConnectionState, string> = {
   connecting: "连接中",
@@ -47,6 +58,8 @@ export function RoomChat({ roomId }: RoomChatProps) {
   const [audioDurations, setAudioDurations] = useState<Record<string, number>>({});
   const [activeAudioId, setActiveAudioId] = useState<string | null>(null);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
+  const [replyTarget, setReplyTarget] = useState<ReplyTarget | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [nickname, setNickname] = useState("");
   const [connectionState, setConnectionState] = useState<ConnectionState>(
@@ -64,12 +77,15 @@ export function RoomChat({ roomId }: RoomChatProps) {
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  const messageRefs = useRef<Record<string, HTMLElement | null>>({});
   const channelRef = useRef<RealtimeChannel | null>(null);
   const connectionStateRef = useRef<ConnectionState>(connectionState);
   const initialLoadDoneRef = useRef(false);
   const shouldStickToBottomRef = useRef(true);
   const pendingScrollBehaviorRef = useRef<ScrollBehavior | null>(null);
   const subscribeVersionRef = useRef(0);
+  const longPressTimerRef = useRef<number | null>(null);
+  const highlightTimerRef = useRef<number | null>(null);
 
   const lastSentAtKey = `temporary-private-chat-last-sent-at-${roomId}`;
 
@@ -88,6 +104,11 @@ export function RoomChat({ roomId }: RoomChatProps) {
   useEffect(() => {
     return () => {
       stopRecordingStream();
+      clearLongPressTimer();
+
+      if (highlightTimerRef.current) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
     };
   }, []);
 
@@ -187,7 +208,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
     const { data, error } = await supabase
       .from("messages")
-      .select("id,room_id,nickname,content,type,file_url,created_at,expires_at")
+      .select(MESSAGE_SELECT_FIELDS)
       .eq("room_id", roomId)
       .gt("expires_at", new Date().toISOString())
       .order("created_at", { ascending: true });
@@ -371,8 +392,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
         content,
         type: "text",
         file_url: null,
+        ...buildReplyPayload(replyTarget),
       })
-      .select("id,room_id,nickname,content,type,file_url,created_at,expires_at")
+      .select(MESSAGE_SELECT_FIELDS)
       .single();
 
     setIsSending(false);
@@ -384,11 +406,12 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
     markSent();
     setDraft("");
+    setReplyTarget(null);
 
     if (data) {
       queueScrollToBottom("smooth");
-      setMessages((current) => appendMessage(current, data as ChatMessage));
-    }
+        setMessages((current) => appendMessage(current, data as ChatMessage));
+      }
   }
 
   async function sendMediaMessage(type: MediaType, url: string) {
@@ -411,8 +434,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
         content: url,
         type,
         file_url: url,
+        ...buildReplyPayload(replyTarget),
       })
-      .select("id,room_id,nickname,content,type,file_url,created_at,expires_at")
+      .select(MESSAGE_SELECT_FIELDS)
       .single();
 
     setIsSending(false);
@@ -423,6 +447,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
 
     markSent();
+    setReplyTarget(null);
 
     if (data) {
       const nextMessage = data as ChatMessage;
@@ -625,6 +650,58 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
   }
 
+  function handleReply(message: ChatMessage) {
+    setReplyTarget({
+      id: message.id,
+      sender: message.nickname,
+      type: message.type,
+      content: getReplySnapshot(message),
+    });
+  }
+
+  function startLongPressReply(message: ChatMessage) {
+    clearLongPressTimer();
+    longPressTimerRef.current = window.setTimeout(() => {
+      handleReply(message);
+      longPressTimerRef.current = null;
+    }, LONG_PRESS_MS);
+  }
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function jumpToQuotedMessage(messageId: string | null) {
+    if (!messageId) {
+      return;
+    }
+
+    const target = messageRefs.current[messageId];
+
+    if (!target) {
+      return;
+    }
+
+    target.scrollIntoView({
+      block: "center",
+      behavior: "smooth",
+    });
+
+    setHighlightedMessageId(messageId);
+
+    if (highlightTimerRef.current) {
+      window.clearTimeout(highlightTimerRef.current);
+    }
+
+    highlightTimerRef.current = window.setTimeout(() => {
+      setHighlightedMessageId(null);
+      highlightTimerRef.current = null;
+    }, HIGHLIGHT_MS);
+  }
+
   return (
     <section className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-3 py-3 sm:px-6 sm:py-5">
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-sm">
@@ -682,9 +759,22 @@ export function RoomChat({ roomId }: RoomChatProps) {
 
           {messages.map((message) => {
             const isMine = message.nickname === nickname;
+            const isHighlighted = highlightedMessageId === message.id;
 
             return (
-              <article key={message.id} className={`flex ${isMine ? "justify-end" : "justify-start"}`}>
+              <article
+                key={message.id}
+                ref={(node) => {
+                  messageRefs.current[message.id] = node;
+                }}
+                className={`flex rounded-lg transition-shadow ${
+                  isMine ? "justify-end" : "justify-start"
+                } ${isHighlighted ? "ring-2 ring-amber-300 ring-offset-2 ring-offset-zinc-50" : ""}`}
+                onTouchStart={() => startLongPressReply(message)}
+                onTouchMove={clearLongPressTimer}
+                onTouchEnd={clearLongPressTimer}
+                onTouchCancel={clearLongPressTimer}
+              >
                 <div
                   className={`max-w-[86%] rounded-lg border px-3 py-2 shadow-sm sm:max-w-[70%] ${
                     isMine
@@ -699,7 +789,27 @@ export function RoomChat({ roomId }: RoomChatProps) {
                   >
                     <span className="max-w-44 truncate font-semibold">{message.nickname}</span>
                     <span>{formatMessageTime(message.created_at)}</span>
+                    <button
+                      type="button"
+                      className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition ${
+                        isMine ? "hover:bg-white/15" : "hover:bg-zinc-100"
+                      }`}
+                      onClick={() => handleReply(message)}
+                      onTouchStart={(event) => event.stopPropagation()}
+                    >
+                      <Reply className="h-3.5 w-3.5" aria-hidden="true" />
+                      引用
+                    </button>
                   </div>
+                  {message.reply_to_content ? (
+                    <QuotedMessageBlock
+                      content={message.reply_to_content}
+                      isMine={isMine}
+                      sender={message.reply_to_sender}
+                      type={message.reply_to_type}
+                      onClick={() => jumpToQuotedMessage(message.reply_to_id)}
+                    />
+                  ) : null}
                   {message.type === "text" ? (
                     <p className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</p>
                   ) : null}
@@ -745,6 +855,28 @@ export function RoomChat({ roomId }: RoomChatProps) {
             className="hidden"
             onChange={handleImageChange}
           />
+          {replyTarget ? (
+            <div className="mb-3 flex items-start gap-3 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-zinc-600">
+                  <Reply className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span className="truncate">{replyTarget.sender}</span>
+                  <span className="rounded bg-white px-1.5 py-0.5 text-zinc-500">
+                    {getMessageTypeLabel(replyTarget.type)}
+                  </span>
+                </div>
+                <p className="mt-1 truncate text-sm text-zinc-700">{replyTarget.content}</p>
+              </div>
+              <button
+                type="button"
+                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-500 transition hover:bg-zinc-200 hover:text-zinc-900"
+                onClick={() => setReplyTarget(null)}
+                title="取消引用"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+          ) : null}
           <div className="flex items-end gap-2">
             <button
               type="button"
@@ -920,6 +1052,99 @@ function AudioMessage({
       />
     </div>
   );
+}
+
+function QuotedMessageBlock({
+  content,
+  isMine,
+  sender,
+  type,
+  onClick,
+}: {
+  content: string;
+  isMine: boolean;
+  sender: string | null;
+  type: ChatMessage["type"] | null;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`mb-2 block w-full rounded-md border-l-4 px-2.5 py-2 text-left transition ${
+        isMine
+          ? "border-white/60 bg-white/15 hover:bg-white/20"
+          : "border-zinc-300 bg-zinc-50 hover:bg-zinc-100"
+      }`}
+      onClick={onClick}
+    >
+      <span className={`block truncate text-xs font-semibold ${isMine ? "text-emerald-50" : "text-zinc-600"}`}>
+        {sender || "匿名用户"} · {getMessageTypeLabel(type)}
+      </span>
+      <span className={`mt-1 block truncate text-sm ${isMine ? "text-white/80" : "text-zinc-500"}`}>
+        {content}
+      </span>
+    </button>
+  );
+}
+
+function buildReplyPayload(replyTarget: ReplyTarget | null) {
+  if (!replyTarget) {
+    return {
+      reply_to_id: null,
+      reply_to_content: null,
+      reply_to_type: null,
+      reply_to_sender: null,
+    };
+  }
+
+  return {
+    reply_to_id: replyTarget.id,
+    reply_to_content: replyTarget.content,
+    reply_to_type: replyTarget.type,
+    reply_to_sender: replyTarget.sender,
+  };
+}
+
+function getReplySnapshot(message: ChatMessage) {
+  if (message.type === "image") {
+    return "[图片]";
+  }
+
+  if (message.type === "audio") {
+    return "[语音]";
+  }
+
+  if (message.type === "video") {
+    return "[视频]";
+  }
+
+  return truncateText(message.content, 50);
+}
+
+function getMessageTypeLabel(type: ChatMessage["type"] | null) {
+  if (type === "image") {
+    return "图片";
+  }
+
+  if (type === "audio") {
+    return "语音";
+  }
+
+  if (type === "video") {
+    return "视频";
+  }
+
+  return "文字";
+}
+
+function truncateText(value: string, maxLength: number) {
+  const trimmed = value.trim();
+
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, maxLength)}...`;
 }
 
 function appendMessage(current: ChatMessage[], nextMessage: ChatMessage) {
