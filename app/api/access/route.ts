@@ -6,7 +6,7 @@ const ACCESS_COOKIE_NAME = "chat_access";
 const ACCESS_TOKEN_PREFIX = "temporary-private-chat-access-v1:";
 
 export async function GET(request: NextRequest) {
-  const accessPin = process.env.CHAT_ACCESS_PIN;
+  const accessPin = getAccessPin();
 
   if (!accessPin) {
     return json({ authorized: false, error: "访问密码尚未配置。" }, 503);
@@ -19,7 +19,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const accessPin = process.env.CHAT_ACCESS_PIN;
+  const accessPin = getAccessPin();
 
   if (!accessPin) {
     return json({ authorized: false, error: "访问密码尚未配置。" }, 503);
@@ -61,6 +61,22 @@ function json(body: unknown, status = 200) {
       "cache-control": "no-store",
     },
   });
+}
+
+function getAccessPin() {
+  const contextSymbol = Symbol.for("__cloudflare-request-context__");
+  const context = (
+    globalThis as unknown as Record<
+      symbol,
+      {
+        env?: {
+          CHAT_ACCESS_PIN?: string;
+        };
+      }
+    >
+  )[contextSymbol];
+
+  return context?.env?.CHAT_ACCESS_PIN ?? process.env.CHAT_ACCESS_PIN;
 }
 
 async function createAccessToken(pin: string) {
