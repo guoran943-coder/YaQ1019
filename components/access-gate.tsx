@@ -108,7 +108,7 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
           </span>
           <div>
             <h1 className="text-lg font-semibold text-zinc-950">请输入访问密码</h1>
-            <p className="mt-1 text-sm text-zinc-500">验证通过后即可进入临时聊天室</p>
+            <p className="mt-1 text-sm text-zinc-500">验证通过后即可进入聊天室</p>
           </div>
         </div>
 

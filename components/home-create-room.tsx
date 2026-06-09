@@ -45,7 +45,7 @@ export function HomeCreateRoom() {
           </div>
           <div className="min-w-0">
             <h1 className="text-2xl font-semibold tracking-normal text-zinc-950 sm:text-3xl">
-              一对一临时聊天
+              一对一私密聊天
             </h1>
             <p className="mt-1 text-sm text-zinc-500">创建房间链接，发给另一个人即可文字聊天。</p>
           </div>
@@ -73,7 +73,7 @@ export function HomeCreateRoom() {
             ) : (
               <Plus className="h-4 w-4" aria-hidden="true" />
             )}
-            创建临时房间
+            创建聊天房间
           </button>
         </div>
 

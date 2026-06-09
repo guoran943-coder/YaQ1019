@@ -778,7 +778,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
         <header className="flex flex-col gap-3 border-b border-zinc-200 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5">
           <div className="min-w-0">
             <h1 className="truncate text-lg font-semibold tracking-normal text-zinc-950">
-              临时聊天房间
+              聊天房间
             </h1>
             <p className="mt-1 text-sm text-zinc-500">昵称：{nickname || "生成中"}</p>
           </div>
