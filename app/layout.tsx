@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { AccessGate } from "@/components/access-gate";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -13,7 +14,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="zh-CN">
-      <body>{children}</body>
+      <body>
+        <AccessGate>{children}</AccessGate>
+      </body>
     </html>
   );
 }
