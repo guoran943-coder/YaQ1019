@@ -3,8 +3,8 @@ import { AccessGate } from "@/components/access-gate";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "一对一私密聊天",
-  description: "一个使用 Next.js、TypeScript、Tailwind CSS 和 Supabase Realtime 构建的一对一私密聊天网页。",
+  title: "访问验证",
+  description: "请输入访问凭证后继续。",
 };
 
 export default function RootLayout({

@@ -108,7 +108,7 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
           </span>
           <div>
             <h1 className="text-lg font-semibold text-zinc-950">请输入访问密码</h1>
-            <p className="mt-1 text-sm text-zinc-500">验证通过后即可进入聊天室</p>
+            <p className="mt-1 text-sm text-zinc-500">验证通过后即可继续</p>
           </div>
         </div>
 
@@ -137,7 +137,7 @@ export function AccessGate({ children }: { children: React.ReactNode }) {
           className="mt-4 inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-zinc-950 px-4 text-sm font-semibold text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-300 disabled:text-zinc-500"
         >
           {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : null}
-          进入聊天室
+          确认
         </button>
       </form>
     </main>
