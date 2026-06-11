@@ -1,28 +1,30 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
+import {
+  ACCESS_COOKIE_NAME,
+  createAccessToken,
+  getAccessPin,
+  isRequestAuthorized,
+  isValidAccessPin,
+  jsonNoStore,
+} from "@/lib/access-server";
 
 export const runtime = "edge";
-
-const ACCESS_COOKIE_NAME = "chat_access";
-const ACCESS_TOKEN_PREFIX = "temporary-private-chat-access-v1:";
 
 export async function GET(request: NextRequest) {
   const accessPin = getAccessPin();
 
   if (!accessPin) {
-    return json({ authorized: false, error: "访问密码尚未配置。" }, 503);
+    return jsonNoStore({ authorized: false, error: "访问密码尚未配置。" }, 503);
   }
 
-  const expectedToken = await createAccessToken(accessPin);
-  const currentToken = request.cookies.get(ACCESS_COOKIE_NAME)?.value ?? "";
-
-  return json({ authorized: safeEqual(currentToken, expectedToken) });
+  return jsonNoStore({ authorized: await isRequestAuthorized(request) });
 }
 
 export async function POST(request: NextRequest) {
   const accessPin = getAccessPin();
 
   if (!accessPin) {
-    return json({ authorized: false, error: "访问密码尚未配置。" }, 503);
+    return jsonNoStore({ authorized: false, error: "访问密码尚未配置。" }, 503);
   }
 
   let submittedPin = "";
@@ -31,17 +33,15 @@ export async function POST(request: NextRequest) {
     const body = (await request.json()) as { pin?: unknown };
     submittedPin = typeof body.pin === "string" ? body.pin : "";
   } catch {
-    return json({ authorized: false, error: "请求格式错误。" }, 400);
+    return jsonNoStore({ authorized: false, error: "请求格式错误。" }, 400);
+  }
+
+  if (!(await isValidAccessPin(submittedPin, accessPin))) {
+    return jsonNoStore({ authorized: false, error: "密码错误。" }, 401);
   }
 
   const expectedToken = await createAccessToken(accessPin);
-  const submittedToken = await createAccessToken(submittedPin);
-
-  if (!safeEqual(submittedToken, expectedToken)) {
-    return json({ authorized: false, error: "密码错误。" }, 401);
-  }
-
-  const response = json({ authorized: true });
+  const response = jsonNoStore({ authorized: true });
   response.cookies.set({
     name: ACCESS_COOKIE_NAME,
     value: expectedToken,
@@ -52,50 +52,4 @@ export async function POST(request: NextRequest) {
   });
 
   return response;
-}
-
-function json(body: unknown, status = 200) {
-  return NextResponse.json(body, {
-    status,
-    headers: {
-      "cache-control": "no-store",
-    },
-  });
-}
-
-function getAccessPin() {
-  const contextSymbol = Symbol.for("__cloudflare-request-context__");
-  const context = (
-    globalThis as unknown as Record<
-      symbol,
-      {
-        env?: {
-          CHAT_ACCESS_PIN?: string;
-        };
-      }
-    >
-  )[contextSymbol];
-
-  return context?.env?.CHAT_ACCESS_PIN ?? process.env.CHAT_ACCESS_PIN;
-}
-
-async function createAccessToken(pin: string) {
-  const bytes = new TextEncoder().encode(`${ACCESS_TOKEN_PREFIX}${pin}`);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function safeEqual(left: string, right: string) {
-  if (left.length !== right.length) {
-    return false;
-  }
-
-  let mismatch = 0;
-
-  for (let index = 0; index < left.length; index += 1) {
-    mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  }
-
-  return mismatch === 0;
 }

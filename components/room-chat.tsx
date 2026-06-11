@@ -42,6 +42,7 @@ type CachedMediaUrl = {
 const MESSAGE_SELECT_FIELDS =
   "id,room_id,nickname,content,type,file_url,reply_to_id,reply_to_content,reply_to_type,reply_to_sender,created_at,expires_at";
 const CHAT_MEDIA_BUCKET = "chat-media";
+const KV_MEDIA_PREFIX = "kv:";
 const MAX_TEXT_LENGTH = 1000;
 const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_COMPRESSED_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -262,6 +263,13 @@ export function RoomChat({ roomId }: RoomChatProps) {
     }
 
     if (mediaUrlsRef.current[message.id]) {
+      return true;
+    }
+
+    if (storagePath.startsWith(KV_MEDIA_PREFIX)) {
+      const key = storagePath.slice(KV_MEDIA_PREFIX.length);
+      const mediaUrl = `/api/media/${key.split("/").map(encodeURIComponent).join("/")}`;
+      setMediaUrl(message.id, mediaUrl, mediaUrlsRef, setMediaUrls);
       return true;
     }
 
@@ -713,33 +721,42 @@ export function RoomChat({ roomId }: RoomChatProps) {
   }
 
   async function uploadMediaFile(file: File, type: MediaType) {
-    const client = supabase;
-
-    if (!client) {
-      setErrorMessage("缺少 Supabase 环境变量，无法上传。");
+    if (!supabase) {
+      setErrorMessage("缺少 Supabase 环境变量，无法发送媒体。");
       return null;
     }
 
     setIsSending(true);
     setErrorMessage("");
 
-    const extension = getSafeExtension(file.name, type);
-    const path = `${roomId}/${type}/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+    const formData = new FormData();
+    formData.set("file", file);
+    formData.set("roomId", roomId);
+    formData.set("type", type);
 
-    const { error } = await client.storage.from(CHAT_MEDIA_BUCKET).upload(path, file, {
-      cacheControl: String(SIGNED_URL_TTL_SECONDS),
-      contentType: file.type,
-      upsert: false,
-    });
+    let response: Response;
 
-    setIsSending(false);
-
-    if (error) {
-      setErrorMessage(`上传失败：${error.message}`);
+    try {
+      response = await fetch("/api/media", {
+        method: "POST",
+        body: formData,
+        credentials: "same-origin",
+      });
+    } catch {
+      setIsSending(false);
+      setErrorMessage("媒体上传失败，请检查网络后重试。");
       return null;
     }
 
-    return path;
+    const result = (await response.json()) as { error?: string; path?: string };
+    setIsSending(false);
+
+    if (!response.ok || !result.path) {
+      setErrorMessage(result.error ?? "媒体上传失败。");
+      return null;
+    }
+
+    return result.path;
   }
 
   function canSendNow() {
@@ -1153,7 +1170,14 @@ function ImageMessage({
         点击放大
       </span>
       {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={imageUrl} alt="聊天图片" className="max-h-72 rounded-md object-contain" onLoad={onLoad} />
+      <img
+        src={imageUrl}
+        alt="聊天图片"
+        className="max-h-72 rounded-md object-contain"
+        decoding="async"
+        loading="lazy"
+        onLoad={onLoad}
+      />
     </button>
   );
 }
@@ -1472,14 +1496,4 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) 
       }
     }, type, quality);
   });
-}
-
-function getSafeExtension(fileName: string, type: MediaType) {
-  const extension = fileName.split(".").pop()?.toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  if (extension) {
-    return extension;
-  }
-
-  return type === "image" ? "jpg" : "webm";
 }

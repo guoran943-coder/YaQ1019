@@ -72,7 +72,7 @@ Deno.serve(async (request) => {
               message.type === "video",
           )
           .map((message) => message.file_url as string | null)
-          .filter((path): path is string => Boolean(path)),
+          .filter((path): path is string => Boolean(path) && !path?.startsWith("kv:")),
       ),
     );
 

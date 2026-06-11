@@ -2,3 +2,7 @@ name = "yaq1019"
 compatibility_date = "2026-06-02"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = ".vercel/output/static"
+
+[[kv_namespaces]]
+binding = "CHAT_MEDIA"
+id = "557c8c41c82548f49794b63e73217ab3"

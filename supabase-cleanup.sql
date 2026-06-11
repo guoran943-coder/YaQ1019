@@ -2,7 +2,7 @@
 -- Run this after deploying the cleanup-expired-messages Edge Function.
 --
 -- Replace these placeholders before running:
---   PROJECT_REF     -> dzoumudzblenbqgkzcgi
+--   PROJECT_REF     -> enzqqzyltthgnosmknld
 --   CLEANUP_SECRET  -> the same value you set as the Edge Function CLEANUP_SECRET
 
 create extension if not exists pg_cron with schema extensions;
