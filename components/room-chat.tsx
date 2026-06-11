@@ -34,12 +34,24 @@ type LoadMessagesOptions = {
   forceScrollToBottom?: boolean;
   silent?: boolean;
 };
+type CachedMediaUrl = {
+  expiresAt: number;
+  url: string;
+};
 
 const MESSAGE_SELECT_FIELDS =
   "id,room_id,nickname,content,type,file_url,reply_to_id,reply_to_content,reply_to_type,reply_to_sender,created_at,expires_at";
 const CHAT_MEDIA_BUCKET = "chat-media";
 const MAX_TEXT_LENGTH = 1000;
-const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_COMPRESSED_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 5 * 1024 * 1024;
+const IMAGE_MAX_DIMENSION = 1600;
+const AUDIO_BITS_PER_SECOND = 32_000;
+const MAX_RECORDING_MS = 5 * 60 * 1000;
+const SIGNED_URL_TTL_SECONDS = 2 * 60 * 60;
+const SIGNED_URL_CACHE_GRACE_MS = 5 * 60 * 1000;
+const MEDIA_URL_CACHE_PREFIX = "chat-media-url:";
 const RATE_LIMIT_MS = 3000;
 const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
 const LONG_PRESS_MS = 550;
@@ -76,7 +88,11 @@ export function RoomChat({ roomId }: RoomChatProps) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimeoutRef = useRef<number | null>(null);
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  const pendingAudioPlayRef = useRef<string | null>(null);
+  const mediaUrlsRef = useRef<Record<string, string>>({});
+  const signedUrlRequestsRef = useRef<Record<string, Promise<string | null>>>({});
   const messageRefs = useRef<Record<string, HTMLElement | null>>({});
   const channelRef = useRef<RealtimeChannel | null>(null);
   const connectionStateRef = useRef<ConnectionState>(connectionState);
@@ -133,6 +149,20 @@ export function RoomChat({ roomId }: RoomChatProps) {
   useEffect(() => {
     connectionStateRef.current = connectionState;
   }, [connectionState]);
+
+  useEffect(() => {
+    const pendingAudioId = pendingAudioPlayRef.current;
+
+    if (!pendingAudioId || !mediaUrls[pendingAudioId]) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      const audio = audioRefs.current[pendingAudioId];
+      pendingAudioPlayRef.current = null;
+      void audio?.play();
+    });
+  }, [mediaUrls]);
 
   const cooldownMs = Math.max(0, cooldownUntil - now);
   const trimmedDraft = draft.trim();
@@ -228,19 +258,45 @@ export function RoomChat({ roomId }: RoomChatProps) {
     const storagePath = message.file_url;
 
     if (!client || !storagePath || message.type === "text") {
-      return;
+      return false;
     }
 
-    const { data, error } = await client.storage
-      .from(CHAT_MEDIA_BUCKET)
-      .createSignedUrl(storagePath, 60 * 60);
-
-    if (!error && data?.signedUrl) {
-      setMediaUrls((current) => ({
-        ...current,
-        [message.id]: data.signedUrl,
-      }));
+    if (mediaUrlsRef.current[message.id]) {
+      return true;
     }
+
+    const cachedUrl = readCachedMediaUrl(storagePath);
+
+    if (cachedUrl) {
+      setMediaUrl(message.id, cachedUrl, mediaUrlsRef, setMediaUrls);
+      return true;
+    }
+
+    if (!signedUrlRequestsRef.current[storagePath]) {
+      signedUrlRequestsRef.current[storagePath] = client.storage
+        .from(CHAT_MEDIA_BUCKET)
+        .createSignedUrl(storagePath, SIGNED_URL_TTL_SECONDS)
+        .then(({ data, error }) => {
+          if (error || !data?.signedUrl) {
+            return null;
+          }
+
+          writeCachedMediaUrl(storagePath, data.signedUrl);
+          return data.signedUrl;
+        })
+        .finally(() => {
+          delete signedUrlRequestsRef.current[storagePath];
+        });
+    }
+
+    const signedUrl = await signedUrlRequestsRef.current[storagePath];
+
+    if (!signedUrl) {
+      return false;
+    }
+
+    setMediaUrl(message.id, signedUrl, mediaUrlsRef, setMediaUrls);
+    return true;
   }, []);
 
   const loadMessages = useCallback(async (options: LoadMessagesOptions = {}) => {
@@ -272,7 +328,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
       const nextMessages = normalizeMessages((data ?? []) as ChatMessage[]);
       setMessages(nextMessages);
       nextMessages.forEach((message) => {
-        void loadSignedUrl(message);
+        if (message.type === "image") {
+          void loadSignedUrl(message);
+        }
       });
 
       initialLoadDoneRef.current = true;
@@ -332,7 +390,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
           }
 
           setMessages((current) => appendMessage(current, nextMessage));
-          void loadSignedUrl(nextMessage);
+          if (nextMessage.type === "image") {
+            void loadSignedUrl(nextMessage);
+          }
         },
       );
 
@@ -517,7 +577,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
       const nextMessage = data as ChatMessage;
       queueScrollToBottom("smooth");
       setMessages((current) => appendMessage(current, nextMessage));
-      void loadSignedUrl(nextMessage);
+      if (nextMessage.type === "image") {
+        void loadSignedUrl(nextMessage);
+      }
     }
   }
 
@@ -534,7 +596,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
       return;
     }
 
-    if (file.size > MAX_FILE_BYTES) {
+    if (file.size > MAX_SOURCE_IMAGE_BYTES) {
       setErrorMessage("单个图片最大 20MB。");
       return;
     }
@@ -544,9 +606,19 @@ export function RoomChat({ roomId }: RoomChatProps) {
       return;
     }
 
-    const uploadedPath = await uploadMediaFile(file, "image");
-    if (uploadedPath) {
-      await sendMediaMessage("image", uploadedPath);
+    setIsSending(true);
+    setErrorMessage("");
+
+    try {
+      const compressedFile = await compressImage(file);
+      const uploadedPath = await uploadMediaFile(compressedFile, "image");
+
+      if (uploadedPath) {
+        await sendMediaMessage("image", uploadedPath);
+      }
+    } catch (error) {
+      setIsSending(false);
+      setErrorMessage(error instanceof Error ? error.message : "图片压缩失败，请换一张图片重试。");
     }
   }
 
@@ -564,7 +636,10 @@ export function RoomChat({ roomId }: RoomChatProps) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const recorder = new MediaRecorder(stream, {
+        audioBitsPerSecond: AUDIO_BITS_PER_SECOND,
+        ...(mimeType ? { mimeType } : {}),
+      });
 
       recordingChunksRef.current = [];
       recordingStreamRef.current = stream;
@@ -581,6 +656,9 @@ export function RoomChat({ roomId }: RoomChatProps) {
       };
 
       recorder.start();
+      recordingTimeoutRef.current = window.setTimeout(() => {
+        stopRecording();
+      }, MAX_RECORDING_MS);
       setIsRecording(true);
       setErrorMessage("");
     } catch (error) {
@@ -611,8 +689,8 @@ export function RoomChat({ roomId }: RoomChatProps) {
       return;
     }
 
-    if (file.size > MAX_FILE_BYTES) {
-      setErrorMessage("单个语音最大 20MB。");
+    if (file.size > MAX_AUDIO_BYTES) {
+      setErrorMessage("单个语音最大 5MB。");
       return;
     }
 
@@ -623,6 +701,11 @@ export function RoomChat({ roomId }: RoomChatProps) {
   }
 
   function stopRecordingStream() {
+    if (recordingTimeoutRef.current) {
+      window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     recordingStreamRef.current = null;
     mediaRecorderRef.current = null;
@@ -644,7 +727,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
     const path = `${roomId}/${type}/${Date.now()}-${crypto.randomUUID()}.${extension}`;
 
     const { error } = await client.storage.from(CHAT_MEDIA_BUCKET).upload(path, file, {
-      cacheControl: "3600",
+      cacheControl: String(SIGNED_URL_TTL_SECONDS),
       contentType: file.type,
       upsert: false,
     });
@@ -711,6 +794,16 @@ export function RoomChat({ roomId }: RoomChatProps) {
   function handleAudioPause(messageId: string) {
     if (activeAudioId === messageId) {
       setActiveAudioId(null);
+    }
+  }
+
+  async function handleAudioRequest(message: ChatMessage) {
+    pendingAudioPlayRef.current = message.id;
+    const loaded = await loadSignedUrl(message);
+
+    if (!loaded) {
+      pendingAudioPlayRef.current = null;
+      setErrorMessage("语音加载失败，请稍后重试。");
     }
   }
 
@@ -906,6 +999,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
                       onLoaded={maybeScrollToBottom}
                       onPause={() => handleAudioPause(message.id)}
                       onPlay={() => handleAudioPlay(message.id)}
+                      onRequest={() => void handleAudioRequest(message)}
                       refSetter={(node) => {
                         audioRefs.current[message.id] = node;
                       }}
@@ -1005,7 +1099,7 @@ export function RoomChat({ roomId }: RoomChatProps) {
             </button>
           </div>
           <div className="mt-2 flex items-center justify-between gap-3 text-xs text-zinc-500">
-            <span>{isRecording ? "正在录音，点方块结束" : "图片和语音最大 20MB"}</span>
+            <span>{isRecording ? "正在录音，最长 5 分钟" : "图片自动压缩，语音按需加载"}</span>
             <span>
               {trimmedDraft.length}/{MAX_TEXT_LENGTH}
             </span>
@@ -1073,6 +1167,7 @@ function AudioMessage({
   onLoaded,
   onPause,
   onPlay,
+  onRequest,
   refSetter,
 }: {
   audioUrl?: string;
@@ -1083,10 +1178,24 @@ function AudioMessage({
   onLoaded: () => void;
   onPause: () => void;
   onPlay: () => void;
+  onRequest: () => void;
   refSetter: (node: HTMLAudioElement | null) => void;
 }) {
   if (!audioUrl) {
-    return <p className="text-sm opacity-80">正在加载语音</p>;
+    return (
+      <button
+        type="button"
+        className={`inline-flex min-w-48 items-center justify-center gap-2 rounded-md border px-4 py-3 text-sm font-medium transition ${
+          isMine
+            ? "border-white/20 bg-white/10 text-white hover:bg-white/15"
+            : "border-zinc-200 bg-zinc-50 text-zinc-700 hover:bg-zinc-100"
+        }`}
+        onClick={onRequest}
+      >
+        <Mic className="h-4 w-4" aria-hidden="true" />
+        点击播放语音
+      </button>
+    );
   }
 
   return (
@@ -1111,6 +1220,7 @@ function AudioMessage({
       <audio
         ref={refSetter}
         controls
+        preload="none"
         src={audioUrl}
         className="w-full"
         onLoadedMetadata={(event) => {
@@ -1248,6 +1358,120 @@ function formatDuration(value?: number) {
   const minutes = Math.floor(value / 60);
   const seconds = Math.floor(value % 60);
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function setMediaUrl(
+  messageId: string,
+  url: string,
+  mediaUrlsRef: React.MutableRefObject<Record<string, string>>,
+  setMediaUrls: React.Dispatch<React.SetStateAction<Record<string, string>>>,
+) {
+  mediaUrlsRef.current[messageId] = url;
+  setMediaUrls((current) => (current[messageId] === url ? current : { ...current, [messageId]: url }));
+}
+
+function readCachedMediaUrl(storagePath: string) {
+  try {
+    const value = window.localStorage.getItem(`${MEDIA_URL_CACHE_PREFIX}${storagePath}`);
+
+    if (!value) {
+      return null;
+    }
+
+    const cached = JSON.parse(value) as CachedMediaUrl;
+
+    if (!cached.url || cached.expiresAt <= Date.now()) {
+      window.localStorage.removeItem(`${MEDIA_URL_CACHE_PREFIX}${storagePath}`);
+      return null;
+    }
+
+    return cached.url;
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedMediaUrl(storagePath: string, url: string) {
+  try {
+    const cached: CachedMediaUrl = {
+      url,
+      expiresAt: Date.now() + SIGNED_URL_TTL_SECONDS * 1000 - SIGNED_URL_CACHE_GRACE_MS,
+    };
+    window.localStorage.setItem(`${MEDIA_URL_CACHE_PREFIX}${storagePath}`, JSON.stringify(cached));
+  } catch {
+    // Browsers with restricted storage can continue without the local URL cache.
+  }
+}
+
+async function compressImage(file: File) {
+  const image = await loadImage(file);
+  let width = image.naturalWidth;
+  let height = image.naturalHeight;
+  const largestDimension = Math.max(width, height);
+
+  if (largestDimension > IMAGE_MAX_DIMENSION) {
+    const scale = IMAGE_MAX_DIMENSION / largestDimension;
+    width = Math.max(1, Math.round(width * scale));
+    height = Math.max(1, Math.round(height * scale));
+  }
+
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    if (attempt > 0) {
+      width = Math.max(1, Math.round(width * 0.85));
+      height = Math.max(1, Math.round(height * 0.85));
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+
+    if (!context) {
+      throw new Error("当前浏览器无法压缩图片。");
+    }
+
+    context.drawImage(image, 0, 0, width, height);
+    const quality = Math.max(0.45, 0.82 - attempt * 0.07);
+    const blob = await canvasToBlob(canvas, "image/webp", quality);
+
+    if (blob.size <= MAX_COMPRESSED_IMAGE_BYTES) {
+      return new File([blob], `image-${Date.now()}.webp`, {
+        type: "image/webp",
+        lastModified: Date.now(),
+      });
+    }
+  }
+
+  throw new Error("图片压缩后仍然过大，请换一张图片重试。");
+}
+
+function loadImage(file: File) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    const objectUrl = URL.createObjectURL(file);
+
+    image.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("无法读取这张图片，请换一张图片重试。"));
+    };
+    image.src = objectUrl;
+  });
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob);
+      } else {
+        reject(new Error("图片压缩失败，请换一张图片重试。"));
+      }
+    }, type, quality);
+  });
 }
 
 function getSafeExtension(fileName: string, type: MediaType) {
